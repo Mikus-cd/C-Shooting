@@ -1,1 +1,144 @@
+#include "raylib.h"
+#include <stdbool.h> // Required for boolean type
 
+// --- CONFIGURATION ---
+const int screenWidth = 800;
+const int screenHeight = 600;
+const float playerSpeed = 5.0f;
+const float bulletSpeed = 10.0f;
+
+// --- STRUCTURES ---
+typedef struct Player {
+    Vector2 position;
+    float radius;
+    Color color;
+} Player;
+
+typedef struct Bullet {
+    Vector2 position;
+    float radius;
+    bool active; // Is the bullet currently flying?
+    Color color;
+} Bullet;
+
+typedef struct Target {
+    Rectangle rect;
+    Color color;
+    bool active; // Is the target still alive?
+} Target;
+
+// --- GAME OBJECTS ---
+static Player player = { 0 };
+static Bullet bullet = { 0 };
+static Target target = { 0 };
+
+
+// --- INITIALIZATION FUNCTIONS ---
+void InitGame(void) {
+    // 1. Initialize Player
+    player.position = (Vector2){ screenWidth / 2.0f, screenHeight - 50.0f };
+    player.radius = 20.0f;
+    player.color = BLUE;
+
+    // 2. Initialize Bullet (inactive initially)
+    bullet.position = player.position;
+    bullet.radius = 5.0f;
+    bullet.active = false;
+    bullet.color = RED;
+
+    // 3. Initialize Target
+    target.rect = (Rectangle){ screenWidth / 2.0f - 30.0f, 50.0f, 60.0f, 30.0f };
+    target.color = GREEN;
+    target.active = true;
+}
+
+// --- UPDATE FUNCTIONS ---
+void UpdatePlayer(void) {
+    // Player Movement (Left/Right)
+    if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A)) {
+        player.position.x -= playerSpeed;
+    }
+    if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) {
+        player.position.x += playerSpeed;
+    }
+
+    // Keep player within screen bounds
+    if (player.position.x < player.radius) player.position.x = player.radius;
+    if (player.position.x > screenWidth - player.radius) player.position.x = screenWidth - player.radius;
+
+    // Shooting
+    if (IsKeyPressed(KEY_SPACE) && !bullet.active) {
+        // Only allow shooting if the previous bullet is not active
+        bullet.position = player.position; // Start bullet from player's position
+        bullet.active = true;
+    }
+}
+
+void UpdateBullet(void) {
+    if (bullet.active) {
+        // Move the bullet upwards
+        bullet.position.y -= bulletSpeed;
+
+        // Check if bullet went off-screen
+        if (bullet.position.y < 0) {
+            bullet.active = false;
+        }
+        
+        // Check for collision with target
+        if (target.active && CheckCollisionCircleRec(bullet.position, bullet.radius, target.rect)) {
+            target.active = false; // Target destroyed!
+            bullet.active = false; // Bullet is consumed
+            // Reset bullet position for next shot
+            bullet.position = player.position; 
+        }
+    }
+}
+
+// --- DRAW FUNCTIONS ---
+void DrawGame(void) {
+    BeginDrawing();
+    
+        ClearBackground(RAYWHITE);
+
+        // Draw Player (as a circle for simplicity)
+        DrawCircleV(player.position, player.radius, player.color);
+
+        // Draw Target
+        if (target.active) {
+            DrawRectangleRec(target.rect, target.color);
+        } else {
+            DrawText("TARGET DESTROYED!", screenWidth / 2 - 100, screenHeight / 2, 20, GOLD);
+        }
+
+        // Draw Bullet
+        if (bullet.active) {
+            DrawCircleV(bullet.position, bullet.radius, bullet.color);
+        }
+
+        DrawFPS(10, 10);
+
+    EndDrawing();
+}
+
+// --- MAIN LOOP ---
+int main(void) {
+    // 1. Initialization
+    InitWindow(screenWidth, screenHeight, "Simple Top-Down Shooter");
+    InitGame();
+    SetTargetFPS(60);
+
+    // 2. Main Game Loop
+    while (!WindowShouldClose()) {
+        // Update
+        UpdatePlayer();
+        UpdateBullet();
+
+        // Draw
+        DrawGame();
+    }
+
+    // 3. De-Initialization
+    CloseWindow();
+
+    return 0;
+}
