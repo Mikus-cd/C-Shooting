@@ -1,1 +1,940 @@
+/*******************************************************************************************
+*
+* Raylib Top-Down Shooter - High Spawn Rate
+* * Changes:
+* 1. Reduced spawn interval significantly (0.5s down to 0.15s).
+* 2. Minions now spawn much closer to each other (Frequent Spawns).
+*
+********************************************************************************************/
 
+#include "raylib.h"
+#include <math.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+#define MAX_BULLETS 128
+#define MAX_ENEMIES 64
+#define MAX_HEALTH_PACKS 32
+#define MAX_WEAPONS 4 
+#define ENEMY_FRAME_COUNT 8 
+
+// ----------------------------------------------------------------------------------
+// Types and Structures Definition
+// ----------------------------------------------------------------------------------
+
+typedef struct {
+    int damage;             
+    int maxAmmo;            
+    int currentAmmo;        
+    float fireRate;         
+    float reloadDuration;   
+    Texture2D texture;      
+    
+    float fireCooldown;     
+    int isReloading;        
+    float reloadTimer;      
+    float reloadMoveSpeedMultiplier; 
+} Weapon;
+
+typedef struct {
+    Vector2 pos;
+    Vector2 vel;
+    float radius;
+    int alive;
+} Bullet;
+
+typedef struct {
+    Vector2 pos;
+    float speed;
+    float radius;
+    int alive;
+    int hp;
+    int maxHp;
+    int type; // 0 = Normal, 1 = Boss, 2 = Speedy Minion
+    
+    // Animation Variables
+    float animTimer;    
+    int currentFrame;   
+} Enemy;
+
+typedef struct {
+    Vector2 pos;
+    float radius;
+    int active;
+} HealthPack;
+
+typedef struct {
+    Vector2 pos;
+    float speed;
+    float radius;
+    int hp;
+    int maxHp; 
+    
+    Weapon weapons[MAX_WEAPONS]; 
+    int currentWeaponIdx;        
+    
+    // Dash
+    float dashCooldown;
+    int isDashing;
+    float dashTimer;
+} GamePlayer;
+
+// ฟังก์ชันช่วยคำนวณ (Clamp)
+static float Clampf(float v, float lo, float hi) {
+    return (v < lo) ? lo : (v > hi) ? hi : v;
+}
+
+// ฟังก์ชันโหลด Texture
+Texture2D LoadTextureFallback(const char* fileName, int width, int height, Color color, const char* text) {
+    if (FileExists(fileName)) {
+        return LoadTexture(fileName);
+    }
+    
+    Image img = GenImageColor(width, height, color);
+    
+    if (width > 40 && height > 20) {
+        ImageDrawText(&img, text, 5, height/3, 20, BLACK); 
+        ImageDrawRectangleLines(&img, (Rectangle){0,0, (float)width, (float)height}, 4, BLACK);
+    }
+
+    Texture2D tex = LoadTextureFromImage(img);
+    UnloadImage(img);
+    return tex;
+}
+
+// ----------------------------------------------------------------------------------
+// Module Functions Declaration
+// ----------------------------------------------------------------------------------
+
+static void SpawnHealthPack(HealthPack* packs, Vector2 position) {
+    for (int i = 0; i < MAX_HEALTH_PACKS; i++) {
+        if (!packs[i].active) {
+            packs[i].pos = position;
+            packs[i].radius = 24.0f; 
+            packs[i].active = 1;
+            break;
+        }
+    }
+}
+
+static void ResetGame(GamePlayer* player, Bullet* bullets, 
+                      Enemy* enemies, int* enemyCount,
+                      HealthPack* healthPacks, 
+                      float* enemySpawnTimer, float* enemySpawnInterval, 
+                      int* score, int* wave, int* gameOver,
+                      int screenW, int screenH,
+                      int* enemiesPerWave, int* enemiesSpawned, int* enemiesRemaining,
+                      int* waveTransition, float* waveTimer,
+                      int* specialMinionsTarget, int* specialMinionsSpawned) {
+
+    player->pos = (Vector2){(float)screenW/2.0f, (float)screenH/2.0f};
+    player->speed = 480.0f; 
+    player->radius = 38.0f; 
+    player->maxHp = 5; 
+    player->hp = player->maxHp;
+    
+    player->isDashing = 0;
+    player->dashTimer = 0.0f;
+    player->dashCooldown = 0.0f;
+    
+    // Reset All Weapons
+    for(int i=0; i<MAX_WEAPONS; i++) {
+        player->weapons[i].currentAmmo = player->weapons[i].maxAmmo;
+        player->weapons[i].isReloading = 0;
+        player->weapons[i].reloadTimer = 0.0f;
+        player->weapons[i].fireCooldown = 0.0f;
+    }
+
+    player->currentWeaponIdx = 0; 
+
+    // Clear Entities
+    for (int i = 0; i < MAX_BULLETS; i++) bullets[i].alive = 0;
+    for (int i = 0; i < MAX_HEALTH_PACKS; i++) healthPacks[i].active = 0;
+
+    *enemyCount = 0;
+    for (int i = 0; i < MAX_ENEMIES; i++) enemies[i].alive = 0;
+
+    *enemySpawnTimer = 0.0f;
+    *enemySpawnInterval = 0.5f; // Start fast (0.5s)
+    *score = 0;
+    *wave = 1;
+    *gameOver = 0;
+    
+    *enemiesPerWave = 8; 
+    *enemiesSpawned = 0;
+    *enemiesRemaining = 8; 
+
+    *waveTransition = 0;
+    *waveTimer = 0.0f;
+    
+    // Reset Special Minion Counters
+    *specialMinionsTarget = GetRandomValue(1, 3); 
+    *specialMinionsSpawned = 0;
+}
+
+static void SpawnEnemy(Enemy* enemies, int* enemyCount, Rectangle arena, int wave, int type) {
+    if (*enemyCount >= MAX_ENEMIES) return; 
+    
+    Enemy e;
+    int edge = GetRandomValue(0, 3);
+    switch (edge) {
+        case 0: e.pos = (Vector2){arena.x, (float)GetRandomValue((int)arena.y, (int)(arena.y + arena.height))}; break;
+        case 1: e.pos = (Vector2){arena.x + arena.width, (float)GetRandomValue((int)arena.y, (int)(arena.y + arena.height))}; break;
+        case 2: e.pos = (Vector2){(float)GetRandomValue((int)arena.x, (int)(arena.x + arena.width)), arena.y}; break;
+        default: e.pos = (Vector2){(float)GetRandomValue((int)arena.x, (int)(arena.x + arena.width)), arena.y + arena.height}; break;
+    }
+    
+    e.type = type;
+    e.animTimer = 0.0f;
+    e.currentFrame = GetRandomValue(0, ENEMY_FRAME_COUNT - 1);
+
+    if (type == 1) { 
+        // BOSS
+        e.maxHp = 300 + (wave / 5) * 200; 
+        float baseSpeed = 190.0f + wave * 30.0f; 
+        e.speed = baseSpeed * (0.9f + (float)GetRandomValue(0, 20)/100.0f);
+        e.radius = 120.0f; 
+    } else if (type == 2) {
+        // SPEEDY MINION
+        e.maxHp = 1; 
+        float baseSpeed = 320.0f + wave * 8.0f; 
+        e.speed = baseSpeed * 2.2f; 
+        e.radius = 32.0f; 
+    } else {
+        // NORMAL MINION
+        e.maxHp = 100 + (wave - 1) * 20;
+        float baseSpeed = 320.0f + wave * 8.0f; 
+        e.speed = baseSpeed * (0.85f + (float)GetRandomValue(0, 30)/100.0f);
+        e.radius = 32.0f; 
+    }
+    
+    e.hp = e.maxHp; 
+    e.alive = 1;
+    enemies[(*enemyCount)++] = e; 
+}
+
+// ----------------------------------------------------------------------------------
+// Main Entry Point
+// ----------------------------------------------------------------------------------
+int main(void) {
+    const int screenW = 2560; 
+    const int screenH = 1600; 
+    InitWindow(screenW, screenH, "Top-Down Shooter - Raylib (High Spawn Rate)");
+    
+    SetTargetFPS(60);
+    
+    // --- LOAD ASSETS ---
+    Texture2D background = LoadTextureFallback("Map1024x768.png", 1024, 768, DARKGRAY, "MAP"); 
+    Texture2D texPistol = LoadTextureFallback("MainC_Pistol.png", 160, 160, BLUE, "PISTOL"); 
+    Texture2D texRifle = LoadTextureFallback("MainC_Rifle.png", 160, 160, ORANGE, "RIFLE"); 
+    Texture2D texSniper = LoadTextureFallback("MainC_Sniper.png", 160, 160, GREEN, "SNIPER");
+    Texture2D texShotgun = LoadTextureFallback("MainC_Shotgun.png", 160, 160, BROWN, "SHOTGUN"); 
+    
+    Texture2D enemySheet = LoadTextureFallback("Robot_MeleeSheet.png", 512, 64, RED, "ENEMY SHEET"); 
+    Texture2D runnerTexture = LoadTextureFallback("Runner.png", 256, 256, PURPLE, "BOSS");      
+    
+    Rectangle sourceRec = { 0, 0, (float)background.width, (float)background.height };
+    Rectangle destRec = { 0, 0, (float)screenW, (float)screenH }; 
+    
+    const float playerSize = 160.0f; 
+    Vector2 playerOrigin = { playerSize / 2.0f, playerSize / 2.0f };
+
+    HideCursor(); 
+
+    Rectangle arena = (Rectangle){40, 40, (float)screenW - 80, (float)screenH - 80};
+
+    // --- Setup Player & Weapons ---
+    GamePlayer player = {0};
+    
+    // Weapon 0: Pistol
+    player.weapons[0].damage = 50;
+    player.weapons[0].maxAmmo = 12;
+    player.weapons[0].fireRate = 0.25f;
+    player.weapons[0].reloadDuration = 1.5f;
+    player.weapons[0].texture = texPistol;
+    player.weapons[0].reloadMoveSpeedMultiplier = 0.8f;
+
+    // Weapon 1: Rifle
+    player.weapons[1].damage = 30;
+    player.weapons[1].maxAmmo = 30;
+    player.weapons[1].fireRate = 0.10f;
+    player.weapons[1].reloadDuration = 2.0f; 
+    player.weapons[1].texture = texRifle;
+    player.weapons[1].reloadMoveSpeedMultiplier = 0.5f;
+
+    // Weapon 2: Sniper
+    player.weapons[2].damage = 1000;        
+    player.weapons[2].maxAmmo = 5;          
+    player.weapons[2].fireRate = 1.0f;      
+    player.weapons[2].reloadDuration = 5.0f; 
+    player.weapons[2].texture = texSniper;
+    player.weapons[2].reloadMoveSpeedMultiplier = 0.2f;
+    
+    // Weapon 3: Shotgun
+    player.weapons[3].damage = 80;       
+    player.weapons[3].maxAmmo = 8;       
+    player.weapons[3].fireRate = 0.8f;   
+    player.weapons[3].reloadDuration = 2.0f;
+    player.weapons[3].texture = texShotgun;
+    player.weapons[3].reloadMoveSpeedMultiplier = 0.6f;
+
+    Bullet bullets[MAX_BULLETS] = {0};
+    Enemy enemies[MAX_ENEMIES] = {0};
+    HealthPack healthPacks[MAX_HEALTH_PACKS] = {0};
+
+    int enemyCount = 0;
+    float enemySpawnTimer = 0.0f;
+    float enemySpawnInterval = 1.0f;
+    int score = 0, wave = 1;
+    int gameOver = 0;
+    
+    int enemiesPerWave = 8; 
+    int enemiesSpawned = 0;            
+    int enemiesRemaining = 8; 
+    
+    int specialMinionsTarget = 0;
+    int specialMinionsSpawned = 0;
+
+    // Dash Config
+    Vector2 dashDirection = {0, 0}; 
+    const float dashDuration = 0.2f;
+    const float dashSpeed = 1300.0f; 
+    const float dashCooldownTime = 1.5f;
+
+    // Wave Transition
+    int waveTransition = 0; 
+    float waveTimer = 0.0f; 
+
+    int gameState = 0; 
+    ShowCursor(); 
+    
+    // ----------------------------------------------------------------------------------
+    // Main Game Loop
+    // ----------------------------------------------------------------------------------
+    while (!WindowShouldClose()) {
+        float dt = GetFrameTime();
+
+        // --- START SCREEN ---
+        if (gameState == 0) {
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                ResetGame(&player, bullets, enemies, &enemyCount, healthPacks,
+                          &enemySpawnTimer, &enemySpawnInterval,
+                          &score, &wave, &gameOver, screenW, screenH,
+                          &enemiesPerWave, &enemiesSpawned, &enemiesRemaining,
+                          &waveTransition, &waveTimer,
+                          &specialMinionsTarget, &specialMinionsSpawned); 
+                gameState = 1; 
+                HideCursor(); 
+            }
+        }
+        // --- GAMEPLAY ---
+        else if (gameState == 1) { 
+            
+            if (!gameOver) {
+                // --- Input: Weapon Switching ---
+                int prevWeaponIdx = player.currentWeaponIdx;
+                if (IsKeyPressed(KEY_ONE)) player.currentWeaponIdx = 0;
+                if (IsKeyPressed(KEY_TWO)) player.currentWeaponIdx = 1;
+                if (IsKeyPressed(KEY_THREE)) player.currentWeaponIdx = 2;
+                if (IsKeyPressed(KEY_FOUR)) player.currentWeaponIdx = 3; 
+                
+                if (prevWeaponIdx != player.currentWeaponIdx) {
+                    player.weapons[prevWeaponIdx].isReloading = 0;
+                    player.weapons[prevWeaponIdx].reloadTimer = 0.0f;
+                }
+                
+                // --- Update Weapons ---
+                for (int i = 0; i < MAX_WEAPONS; i++) { 
+                    Weapon *w = &player.weapons[i];
+                    if (w->fireCooldown > 0.0f) w->fireCooldown -= dt;
+                    
+                    if (w->isReloading) {
+                        w->reloadTimer += dt;
+                        if (w->reloadTimer >= w->reloadDuration) {
+                            w->currentAmmo = w->maxAmmo; 
+                            w->isReloading = 0;
+                            w->reloadTimer = 0.0f;
+                            w->fireCooldown = 0.0f; 
+                        }
+                    }
+                }
+
+                Weapon *currentWpn = &player.weapons[player.currentWeaponIdx];
+
+                // --- Input: Movement ---
+                Vector2 move = (Vector2){0, 0};
+                if (IsKeyDown(KEY_W) || IsKeyDown(KEY_UP)) move.y -= 1;
+                if (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN)) move.y += 1;
+                if (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT)) move.x -= 1;
+                if (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) move.x += 1;
+
+                float mag = sqrtf(move.x*move.x + move.y*move.y);
+                if (mag > 0.0f) { move.x /= mag; move.y /= mag; } 
+
+                Vector2 mouse = GetMousePosition();
+                Vector2 aim = (Vector2){ mouse.x - player.pos.x, mouse.y - player.pos.y };
+                float aimLen = sqrtf(aim.x*aim.x + aim.y*aim.y);
+                if (aimLen > 0.0f) { aim.x /= aimLen; aim.y /= aimLen; } 
+
+                // --- Logic: Dash ---
+                if (player.isDashing) {
+                    player.dashTimer += dt;
+                    player.pos.x += dashDirection.x * dashSpeed * dt;
+                    player.pos.y += dashDirection.y * dashSpeed * dt;
+
+                    if (player.dashTimer >= dashDuration) {
+                        player.isDashing = 0;
+                        player.dashCooldown = dashCooldownTime;
+                    }
+                } 
+                else {
+                    if (player.dashCooldown > 0.0f) player.dashCooldown -= dt;
+
+                    if (IsKeyPressed(KEY_SPACE) && player.dashCooldown <= 0.0f) {
+                        player.isDashing = 1;
+                        player.dashTimer = 0.0f;
+                        dashDirection = (mag > 0.0f) ? move : aim;
+                    }
+
+                    float currentSpeed = player.speed;
+                    player.pos.x += move.x * currentSpeed * dt;
+                    player.pos.y += move.y * currentSpeed * dt;
+                }
+
+                player.pos.x = Clampf(player.pos.x, arena.x + player.radius, arena.x + arena.width - player.radius);
+                player.pos.y = Clampf(player.pos.y, arena.y + player.radius, arena.y + arena.height - player.radius);
+
+                // --- Input: Reload ---
+                if (!currentWpn->isReloading) {
+                    if (IsKeyPressed(KEY_R) || (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && currentWpn->currentAmmo == 0)) {
+                        if (currentWpn->currentAmmo < currentWpn->maxAmmo) { 
+                            currentWpn->isReloading = 1;
+                            currentWpn->reloadTimer = 0.0f;
+                        }
+                    }
+                }
+
+                // --- Input: Shooting ---
+                if (!player.isDashing && IsMouseButtonDown(MOUSE_BUTTON_LEFT) && 
+                    currentWpn->fireCooldown <= 0.0f && !currentWpn->isReloading && currentWpn->currentAmmo > 0) {
+                    
+                    int projectiles = 1;
+                    if (player.currentWeaponIdx == 3) projectiles = 3; 
+
+                    float angles[] = {0.0f, -0.15f, 0.15f}; 
+
+                    int shotsFired = 0;
+                    for (int p = 0; p < projectiles; p++) {
+                        int freeIndex = -1;
+                        for (int i = 0; i < MAX_BULLETS; i++) {
+                            if (bullets[i].alive == 0) {
+                                freeIndex = i;
+                                break;
+                            }
+                        }
+
+                        if (freeIndex != -1) {
+                            Bullet b;
+                            float bulletSpeed = (player.currentWeaponIdx == 2) ? 1920.0f : 960.0f; 
+                            if (player.currentWeaponIdx == 3) bulletSpeed = 1120.0f; 
+
+                            Vector2 dir = aim;
+                            if (player.currentWeaponIdx == 3) {
+                                float theta = angles[p];
+                                float cs = cosf(theta);
+                                float sn = sinf(theta);
+                                dir.x = aim.x * cs - aim.y * sn;
+                                dir.y = aim.x * sn + aim.y * cs;
+                            }
+
+                            b.pos = (Vector2){ player.pos.x + dir.x * player.radius, player.pos.y + dir.y * player.radius };
+                            b.vel = (Vector2){ dir.x * bulletSpeed, dir.y * bulletSpeed };
+                            b.radius = 6.0f; 
+                            b.alive = 1;
+                            bullets[freeIndex] = b; 
+                            shotsFired++;
+                        }
+                    }
+
+                    if (shotsFired > 0) {
+                        currentWpn->fireCooldown = currentWpn->fireRate; 
+                        currentWpn->currentAmmo--; 
+                    }
+                }
+
+                // --- Logic: Spawning ---
+                if (waveTransition) {
+                    waveTimer -= dt;
+                    if (waveTimer <= 0.0f) {
+                        waveTransition = 0;
+                        wave++;
+                        
+                        int baseMinions = 8 + (wave - 1);
+                        if (wave % 5 == 0) enemiesPerWave = baseMinions + 1;
+                        else enemiesPerWave = baseMinions;
+                        
+                        enemiesSpawned = 0;
+                        enemySpawnTimer = 0.0f;
+                        
+                        specialMinionsTarget = GetRandomValue(1, 3);
+                        specialMinionsSpawned = 0;
+                    }
+                } 
+                else {
+                    enemySpawnTimer += dt;
+                    if (enemiesSpawned < enemiesPerWave && enemySpawnTimer >= enemySpawnInterval) {
+                        int typeToSpawn = 0; 
+                        
+                        if (wave % 5 == 0 && enemiesSpawned == enemiesPerWave - 1) {
+                            typeToSpawn = 1; 
+                        } 
+                        else {
+                            int remainingSpawns = enemiesPerWave - enemiesSpawned;
+                            int remainingSpecials = specialMinionsTarget - specialMinionsSpawned;
+                            
+                            if (remainingSpecials > 0) {
+                                if (remainingSpawns <= remainingSpecials || GetRandomValue(0, 100) < 30) {
+                                    typeToSpawn = 2;
+                                    specialMinionsSpawned++;
+                                }
+                            }
+                        }
+                        
+                        SpawnEnemy(enemies, &enemyCount, arena, wave, typeToSpawn);
+                        enemySpawnTimer = 0.0f;
+                        enemiesSpawned++;
+                        
+                        // Frequent Spawn Logic
+                        if (wave % 5 != 0) enemySpawnInterval = fmaxf(0.15f, 0.5f - (wave - 1) * 0.02f); 
+                        else enemySpawnInterval = 0.3f; 
+                    }
+                    
+                    if (enemiesSpawned >= enemiesPerWave && enemiesRemaining <= 0) {
+                        waveTransition = 1;
+                        waveTimer = 7.0f; 
+                    }
+                }
+
+                // --- Logic: Updates & Collisions ---
+                for (int i = 0; i < enemyCount; i++) {
+                    if (!enemies[i].alive) continue;
+                    Vector2 dir = (Vector2){ player.pos.x - enemies[i].pos.x, player.pos.y - enemies[i].pos.y };
+                    float d = sqrtf(dir.x*dir.x + dir.y*dir.y);
+                    if (d > 0.0f) { dir.x /= d; dir.y /= d; }
+                    enemies[i].pos.x += dir.x * enemies[i].speed * dt;
+                    enemies[i].pos.y += dir.y * enemies[i].speed * dt;
+
+                    if (enemies[i].type == 0 || enemies[i].type == 2) {
+                        enemies[i].animTimer += dt;
+                        if (enemies[i].animTimer >= 0.1f) { 
+                            enemies[i].animTimer = 0.0f;
+                            enemies[i].currentFrame++;
+                            if (enemies[i].currentFrame >= ENEMY_FRAME_COUNT) enemies[i].currentFrame = 0; 
+                        }
+                    }
+                }
+                
+                for (int j = 0; j < enemyCount; j++) {
+                    if (!enemies[j].alive) continue;
+                    float dx = player.pos.x - enemies[j].pos.x;
+                    float dy = player.pos.y - enemies[j].pos.y;
+                    float r = player.radius + enemies[j].radius;
+                    
+                    if (dx*dx + dy*dy <= r*r) {
+                        if (!player.isDashing) {
+                            if (enemies[j].type == 1) { 
+                                player.hp = 0;
+                                gameOver = 1;
+                            } else {
+                                enemies[j].alive = 0;
+                                player.hp--;
+                                if (player.hp <= 0) gameOver = 1;
+                            }
+                        }
+                    }
+                }
+
+                for (int i = 0; i < MAX_HEALTH_PACKS; i++) {
+                    if (healthPacks[i].active) {
+                        float dx = player.pos.x - healthPacks[i].pos.x;
+                        float dy = player.pos.y - healthPacks[i].pos.y;
+                        float r = player.radius + healthPacks[i].radius;
+                        if (dx*dx + dy*dy <= r*r) {
+                            healthPacks[i].active = 0;
+                            if (player.hp < player.maxHp) {
+                                player.hp++;
+                            }
+                        }
+                    }
+                }
+            
+            } else { // Game Over
+                if (IsKeyPressed(KEY_R)) {
+                    ResetGame(&player, bullets, enemies, &enemyCount, healthPacks,
+                              &enemySpawnTimer, &enemySpawnInterval,
+                              &score, &wave, &gameOver, screenW, screenH,
+                              &enemiesPerWave, &enemiesSpawned, &enemiesRemaining,
+                              &waveTransition, &waveTimer,
+                              &specialMinionsTarget, &specialMinionsSpawned); 
+                }
+            }
+
+            for (int i = 0; i < MAX_BULLETS; i++) {
+                if (!bullets[i].alive) continue;
+                bullets[i].pos.x += bullets[i].vel.x * dt;
+                bullets[i].pos.y += bullets[i].vel.y * dt;
+                if (bullets[i].pos.x < arena.x || bullets[i].pos.x > arena.x + arena.width ||
+                    bullets[i].pos.y < arena.y || bullets[i].pos.y > arena.y + arena.height) {
+                    bullets[i].alive = 0;
+                }
+            }
+
+            if (!gameOver) {
+                Weapon *currentWpn = &player.weapons[player.currentWeaponIdx];
+                for (int i = 0; i < MAX_BULLETS; i++) { 
+                    if (!bullets[i].alive) continue;
+                    for (int j = 0; j < enemyCount; j++) {
+                        if (!enemies[j].alive) continue;
+                        float dx = bullets[i].pos.x - enemies[j].pos.x;
+                        float dy = bullets[i].pos.y - enemies[j].pos.y;
+                        float r = bullets[i].radius + enemies[j].radius;
+                        if (dx*dx + dy*dy <= r*r) {
+                            bullets[i].alive = 0; 
+                            enemies[j].hp -= currentWpn->damage;
+                            
+                            if (enemies[j].hp <= 0) {
+                                enemies[j].alive = 0; 
+                                score += (enemies[j].type == 1) ? 50 : (enemies[j].type == 2 ? 5 : 1); 
+                                
+                                if (enemies[j].type == 0 || enemies[j].type == 2) {
+                                    if (GetRandomValue(0, 99) < 5) { 
+                                        SpawnHealthPack(healthPacks, enemies[j].pos);
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            enemiesRemaining = 0;
+            int writeIndex = 0;
+            for (int readIndex = 0; readIndex < enemyCount; readIndex++) {
+                if (enemies[readIndex].alive) {
+                    if (readIndex != writeIndex) {
+                        enemies[writeIndex] = enemies[readIndex];
+                    }
+                    writeIndex++;
+                    enemiesRemaining++;
+                }
+            }
+            enemyCount = writeIndex;
+        }
+
+        // ----------------------------------------------------------------------------------
+        // Draw
+        // ----------------------------------------------------------------------------------
+        BeginDrawing();
+        ClearBackground((Color){20, 22, 28, 255}); 
+
+        if (gameState == 0) {
+            ShowCursor();
+            const char *title = "TOP-DOWN SHOOTER";
+            const char *instruction = "Click Left Mouse Button to START";
+            DrawText(title, screenW/2 - MeasureText(title, 60)/2, screenH/2 - 80, 60, (Color){150, 255, 150, 255}); 
+            DrawText(instruction, screenW/2 - MeasureText(instruction, 35)/2, screenH/2 + 30, 35, RAYWHITE); 
+            
+        } else { 
+            if (gameOver) ShowCursor(); else HideCursor();
+            
+            DrawTexturePro(background, sourceRec, destRec, (Vector2){0, 0}, 0.0f, RAYWHITE);
+            DrawRectangleLinesEx(arena, 2.0f, (Color){110, 120, 150, 255});
+
+            Vector2 mouse = GetMousePosition();
+            Vector2 aim = (Vector2){ mouse.x - player.pos.x, mouse.y - player.pos.y };
+            float aimLen = sqrtf(aim.x*aim.x + aim.y*aim.y);
+            float rotation = 0.0f;
+            if (aimLen > 0.0f) { 
+                aim.x /= aimLen; 
+                aim.y /= aimLen; 
+                rotation = atan2f(aim.y, aim.x) * RAD2DEG; 
+            }
+
+            // Draw Health Packs (Scaled)
+            for (int i = 0; i < MAX_HEALTH_PACKS; i++) {
+                if (healthPacks[i].active) {
+                    float size = 48.0f; 
+                    DrawRectangle((int)(healthPacks[i].pos.x - size/2), (int)(healthPacks[i].pos.y - size/2), (int)size, (int)size, RAYWHITE);
+                    DrawRectangleLines((int)(healthPacks[i].pos.x - size/2), (int)(healthPacks[i].pos.y - size/2), (int)size, (int)size, GRAY);
+                    float plusThick = 9.0f;
+                    float plusLen = 27.0f;
+                    DrawRectangle((int)(healthPacks[i].pos.x - plusLen/2), (int)(healthPacks[i].pos.y - plusThick/2), (int)plusLen, (int)plusThick, GREEN);
+                    DrawRectangle((int)(healthPacks[i].pos.x - plusThick/2), (int)(healthPacks[i].pos.y - plusLen/2), (int)plusThick, (int)plusLen, GREEN);
+                }
+            }
+
+            if (!gameOver) {
+                Color glowColor = (Color){ 0, 255, 100, 255 };
+                int layers = 8; 
+                float baseRadius = playerSize / 6.0f; 
+                for (int i = 0; i < layers; i++) {
+                    float r = baseRadius + (i * 3.0f);
+                    float alpha = 0.3f - (i * 0.035f);
+                    if (alpha < 0.0f) alpha = 0.0f;
+                    DrawCircleV(player.pos, r, Fade(glowColor, alpha));
+                }
+            }
+
+            Color playerCol;
+            if (gameOver) playerCol = RED;
+            else if (player.isDashing) playerCol = SKYBLUE;
+            else playerCol = (Color){255, 255, 255, 255};
+
+            Weapon *drawWpn = &player.weapons[player.currentWeaponIdx];
+            Rectangle playerSourceRec = { 0.0f, 0.0f, (float)drawWpn->texture.width, (float)drawWpn->texture.height };
+            Rectangle playerDestRec = { player.pos.x, player.pos.y, playerSize, playerSize };
+            
+            DrawTexturePro(drawWpn->texture, playerSourceRec, playerDestRec, playerOrigin, rotation, playerCol);
+
+            if (drawWpn->isReloading && !gameOver) {
+                float progress = drawWpn->reloadTimer / drawWpn->reloadDuration;
+                float barWidth = 60.0f; 
+                float barHeight = 10.0f; 
+                int barX = (int)(player.pos.x - barWidth / 2.0f);
+                int barY = (int)(player.pos.y - player.radius - 35.0f); 
+                
+                DrawRectangle(barX, barY, (int)barWidth, (int)barHeight, (Color){50, 50, 50, 200});
+                DrawRectangle(barX, barY, (int)(barWidth * progress), (int)barHeight, YELLOW);
+                DrawRectangleLines(barX, barY, (int)barWidth, (int)barHeight, RAYWHITE);
+                
+                const char *reloadMsg = "RELOAD";
+                int tw = MeasureText(reloadMsg, 16);
+                DrawText(reloadMsg, barX + (int)(barWidth/2.0f) - tw/2, barY - 18, 16, YELLOW);
+            }
+
+            for (int i = 0; i < MAX_BULLETS; i++) {
+                if (!bullets[i].alive) continue;
+                DrawCircle((int)bullets[i].pos.x, (int)bullets[i].pos.y, bullets[i].radius, (Color){240, 240, 80, 255});
+            }
+
+            Color enemyGlowColor = (Color){ 255, 50, 50, 255 };
+            int enemyGlowLayers = 6; 
+
+            for (int i = 0; i < enemyCount; i++) {
+                if (!enemies[i].alive) continue;
+                
+                Texture2D currentTex = (enemies[i].type == 1) ? runnerTexture : enemySheet;
+                
+                // SCALED DRAW SIZES
+                float currentSize = (enemies[i].type == 1) ? 416.0f : 136.0f; 
+                float enemyBaseRadius = currentSize / 3.0f;
+                
+                if (enemies[i].type == 2) {
+                    DrawCircleV(enemies[i].pos, enemies[i].radius + 18, Fade(YELLOW, 0.5f));
+                    DrawCircleV(enemies[i].pos, enemies[i].radius + 10, Fade(ORANGE, 0.6f));
+                } else {
+                    for (int j = 0; j < enemyGlowLayers; j++) {
+                        float r = enemyBaseRadius + (j * 6.0f);
+                        float alpha = 0.3f - (j * 0.04f);
+                        if (alpha < 0.0f) alpha = 0.0f;
+                        DrawCircleV(enemies[i].pos, r, Fade(enemyGlowColor, alpha));
+                    }
+                }
+                
+                float dx = player.pos.x - enemies[i].pos.x;
+                float dy = player.pos.y - enemies[i].pos.y;
+                float enemyRotation = atan2f(dy, dx) * RAD2DEG; 
+
+                if (enemies[i].type == 1) { 
+                    Rectangle bossSource = { 0.0f, 0.0f, (float)currentTex.width, (float)currentTex.height };
+                    Rectangle bossDest = { enemies[i].pos.x, enemies[i].pos.y, currentSize, currentSize };
+                    Vector2 bossOrigin = { currentSize / 2.0f, currentSize / 2.0f };
+                    DrawTexturePro(currentTex, bossSource, bossDest, bossOrigin, enemyRotation, WHITE);
+                } else {
+                    float frameWidth = (float)currentTex.width / (float)ENEMY_FRAME_COUNT;
+                    float frameHeight = (float)currentTex.height;
+                    
+                    Rectangle animSource = { frameWidth * enemies[i].currentFrame, 0.0f, frameWidth, frameHeight };
+                    Rectangle animDest = { enemies[i].pos.x, enemies[i].pos.y, currentSize, currentSize };
+                    Vector2 animOrigin = { currentSize / 2.0f, currentSize / 2.0f };
+                    
+                    Color tint = (enemies[i].type == 2) ? YELLOW : WHITE;
+                    DrawTexturePro(currentTex, animSource, animDest, animOrigin, enemyRotation, tint);
+                }
+
+                float hpPercent = (float)enemies[i].hp / (float)enemies[i].maxHp;
+                if (hpPercent < 0.0f) hpPercent = 0.0f;
+                
+                float barWidth = (enemies[i].type == 1) ? 200.0f : 60.0f; 
+                float barHeight = 8.0f;
+                float barX = enemies[i].pos.x - barWidth / 2.0f;
+                float barY = enemies[i].pos.y - (currentSize/2.0f) - 15.0f; 
+                
+                DrawRectangle(barX, barY, barWidth, barHeight, RED);
+                DrawRectangle(barX, barY, barWidth * hpPercent, barHeight, GREEN);
+            }
+            
+            if (waveTransition && !gameOver) {
+                if (waveTimer > 5.0f) {
+                    const char *txt = "CLEAR!";
+                    int fontSize = 120;
+                    int txtW = MeasureText(txt, fontSize);
+                    DrawText(txt, screenW/2 - txtW/2, screenH/2 - fontSize/2, fontSize, YELLOW);
+                } else if (waveTimer > 2.0f) {
+                    int count = (int)ceilf(waveTimer - 2.0f);
+                    if (count > 0) {
+                        const char *txt = TextFormat("%d", count);
+                        int fontSize = 150;
+                        int txtW = MeasureText(txt, fontSize);
+                        DrawText(txt, screenW/2 - txtW/2, screenH/2 - fontSize/2, fontSize, ORANGE);
+                    }
+                } else {
+                    const char *txt = TextFormat("WAVE %d", wave + 1);
+                    int fontSize = 120;
+                    int txtW = MeasureText(txt, fontSize);
+                    DrawText(txt, screenW/2 - txtW/2, screenH/2 - fontSize/2, fontSize, RAYWHITE);
+
+                    if ((wave + 1) % 5 == 0) {
+                         const char *bossMsg = "BOSS IS COMING!";
+                         int bossFontSize = 80; 
+                         int bossTw = MeasureText(bossMsg, bossFontSize);
+                         DrawText(bossMsg, screenW/2 - bossTw/2, screenH/2 - fontSize/2 + 130, bossFontSize, RED);
+                    }
+                }
+            }
+
+            // --- UI / HUD (SCALED UP) ---
+            int fontSize = 45; 
+            int y_start = 30;
+            int y_offset = y_start;
+            int x_left = 30;
+            
+            float hpPct = (float)player.hp / (float)player.maxHp;
+            Color hpColor = ColorFromHSV(hpPct * 120.0f, 0.8f, 0.9f);
+            if (player.hp <= 1) hpColor = RED; 
+
+            DrawText(TextFormat("HP: %d / %d", player.hp, player.maxHp), x_left, y_offset, fontSize, hpColor);
+            y_offset += fontSize + 12; 
+            
+            DrawText(TextFormat("Score: %d", score), x_left, y_offset, fontSize, RAYWHITE);
+            y_offset += fontSize + 12; 
+            
+            Color dashTextColor = (player.dashCooldown > 0.0f) ? GRAY : SKYBLUE;
+            if (player.dashCooldown > 0.0f) {
+                DrawText(TextFormat("Dash: %.1fs", player.dashCooldown), x_left, y_offset, fontSize, dashTextColor);
+            } else {
+                DrawText("Dash: READY", x_left, y_offset, fontSize, dashTextColor);
+            }
+            y_offset += fontSize + 12;
+
+            DrawText(TextFormat("Enemies: %d", enemiesRemaining), x_left, y_offset, fontSize, RAYWHITE);
+
+            const char *waveText = TextFormat("Wave: %d", wave);
+            int waveTw = MeasureText(waveText, fontSize + 4); 
+            DrawText(waveText, screenW/2 - waveTw/2, y_start, fontSize + 4, (Color){150, 255, 150, 255});
+
+            DrawText("Move: WASD | Aim: Mouse | Shoot: LMB | Weapon: 1/2/3/4 | Reload: R | Dash: Space", 30, screenH - 50, 28, (Color){180, 180, 200, 255});
+
+            // UI Weapons
+            int slotSize = 140; 
+            int slotPadding = 20;
+            int totalWidth = (slotSize * MAX_WEAPONS) + (slotPadding * (MAX_WEAPONS - 1)); 
+            int startX = screenW - totalWidth - 40;
+            int startY = 40;
+
+            for (int i = 0; i < MAX_WEAPONS; i++) {
+                int bx = startX + i * (slotSize + slotPadding);
+                int by = startY;
+                
+                Weapon *w = &player.weapons[i];
+                int isActive = (i == player.currentWeaponIdx);
+                
+                DrawRectangle(bx, by, slotSize, slotSize, (Color){ 30, 30, 30, 200 });
+                
+                if (isActive) {
+                    DrawRectangleLinesEx((Rectangle){bx, by, slotSize, slotSize}, 5.0f, YELLOW);
+                } else {
+                    DrawRectangleLinesEx((Rectangle){bx, by, slotSize, slotSize}, 2.0f, GRAY);
+                }
+                
+                float scale = (float)(slotSize - 30) / (float)w->texture.width;
+                float texX = bx + (slotSize - w->texture.width * scale) / 2;
+                float texY = by + (slotSize - w->texture.height * scale) / 2;
+                
+                DrawTextureEx(w->texture, (Vector2){ texX, texY }, 0.0f, scale, isActive ? WHITE : Fade(WHITE, 0.6f));
+                
+                DrawText(TextFormat("%d", i + 1), bx + 10, by + 10, 30, isActive ? YELLOW : GRAY);
+                
+                const char *name = (i == 0) ? "PISTOL" : (i == 1) ? "RIFLE" : (i == 2) ? "SNIPER" : "SHOTGUN";
+                DrawText(name, bx + 10, by + slotSize - 25, 16, isActive ? RAYWHITE : GRAY);
+
+                if (w->isReloading) {
+                    float reloadPct = w->reloadTimer / w->reloadDuration;
+                    DrawRectangle(bx, by + slotSize - 8, (int)(slotSize * reloadPct), 8, YELLOW);
+                }
+            }
+
+            // Ammo Count
+            Weapon *currentWpn = &player.weapons[player.currentWeaponIdx];
+            const char *ammoText = TextFormat("%d / %d", currentWpn->currentAmmo, currentWpn->maxAmmo);
+            int ammoFontSize = 90; 
+            int ammoW = MeasureText(ammoText, ammoFontSize);
+            int ammoX = screenW - ammoW - 60;
+            int ammoY = screenH - ammoFontSize - 60;
+
+            Color ammoColor = (currentWpn->currentAmmo == 0) ? RED : (currentWpn->currentAmmo < currentWpn->maxAmmo * 0.3f) ? ORANGE : RAYWHITE;
+
+            DrawText("AMMO", ammoX, ammoY - 40, 30, GRAY);
+            DrawText(ammoText, ammoX, ammoY, ammoFontSize, ammoColor);
+
+            // Crosshair
+            {
+                int size = 18;
+                Color crossCol = (Color){255, 255, 255, 200};
+                DrawLine((int)(mouse.x - size), (int)mouse.y, (int)(mouse.x + size), (int)mouse.y, crossCol);
+                DrawLine((int)mouse.x, (int)(mouse.y - size), (int)mouse.x, (int)(mouse.y + size), crossCol);
+                DrawCircle((int)mouse.x, (int)mouse.y, 5, crossCol);
+            }
+
+            if (gameOver) {
+                DrawRectangle(0, 0, screenW, screenH, (Color){0, 0, 0, 200});
+
+                const char *title = "GAME OVER";
+                const char *scoreTxt = TextFormat("Total Score: %d", score);
+                const char *waveTxt = TextFormat("Wave Reached: %d", wave);
+                const char *restart = "Press [R] to Restart";
+
+                int titleSize = 120;
+                int statSize = 60;
+                int instrSize = 40;
+
+                int titleW = MeasureText(title, titleSize);
+                int scoreW = MeasureText(scoreTxt, statSize);
+                int waveW = MeasureText(waveTxt, statSize);
+                int instrW = MeasureText(restart, instrSize);
+
+                int centerY = screenH / 2;
+
+                DrawText(title, screenW/2 - titleW/2, centerY - 150, titleSize, RED);
+                DrawText(scoreTxt, screenW/2 - scoreW/2, centerY, statSize, WHITE);
+                DrawText(waveTxt, screenW/2 - waveW/2, centerY + 80, statSize, WHITE);
+                DrawText(restart, screenW/2 - instrW/2, centerY + 180, instrSize, GRAY);
+            }
+        }
+        
+        EndDrawing();
+    }
+    
+    // Unload Textures
+    UnloadTexture(background);
+    UnloadTexture(texPistol); 
+    UnloadTexture(texRifle); 
+    UnloadTexture(texSniper); 
+    UnloadTexture(texShotgun); 
+    UnloadTexture(runnerTexture); 
+    UnloadTexture(enemySheet);
+
+    CloseWindow();
+    return 0;
+}
